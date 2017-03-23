@@ -40,7 +40,6 @@ type TestPerformanceConfig struct {
 type TestPortConfig struct {
 	DNS     int `json:"dns,omitempty"`
 	HTTP    int `json:"http,omitempty"`
-	RPC     int `json:"rpc,omitempty"`
 	SerfLan int `json:"serf_lan,omitempty"`
 	SerfWan int `json:"serf_wan,omitempty"`
 	Server  int `json:"server,omitempty"`
@@ -66,6 +65,7 @@ type TestServerConfig struct {
 	Bind              string                 `json:"bind_addr,omitempty"`
 	Addresses         *TestAddressConfig     `json:"addresses,omitempty"`
 	Ports             *TestPortConfig        `json:"ports,omitempty"`
+	RaftProtocol      int                    `json:"raft_protocol,omitempty"`
 	ACLMasterToken    string                 `json:"acl_master_token,omitempty"`
 	ACLDatacenter     string                 `json:"acl_datacenter,omitempty"`
 	ACLDefaultPolicy  string                 `json:"acl_default_policy,omitempty"`
@@ -95,7 +95,6 @@ func defaultServerConfig() *TestServerConfig {
 		Ports: &TestPortConfig{
 			DNS:     randomPort(),
 			HTTP:    randomPort(),
-			RPC:     randomPort(),
 			SerfLan: randomPort(),
 			SerfWan: randomPort(),
 			Server:  randomPort(),

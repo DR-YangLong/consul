@@ -2,7 +2,6 @@ package command
 
 import (
 	"fmt"
-	"io"
 	"io/ioutil"
 	"math/rand"
 	"net"
@@ -16,6 +15,7 @@ import (
 	"github.com/hashicorp/consul/command/agent"
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/logger"
+	"github.com/hashicorp/consul/version"
 	"github.com/mitchellh/cli"
 )
 
@@ -24,20 +24,20 @@ var offset uint64
 func init() {
 	// Seed the random number generator
 	rand.Seed(time.Now().UnixNano())
+
+	version.Version = "0.8.0"
 }
 
 type agentWrapper struct {
 	dir      string
 	config   *agent.Config
 	agent    *agent.Agent
-	rpc      *agent.AgentRPC
 	http     *agent.HTTPServer
 	addr     string
 	httpAddr string
 }
 
 func (a *agentWrapper) Shutdown() {
-	a.rpc.Shutdown()
 	a.agent.Shutdown()
 	a.http.Shutdown()
 	os.RemoveAll(a.dir)
@@ -67,7 +67,6 @@ func testAgentWithConfigReload(t *testing.T, cb func(c *agent.Config), reloadCh 
 	}
 
 	lw := logger.NewLogWriter(512)
-	mult := io.MultiWriter(os.Stderr, lw)
 
 	conf := nextConfig()
 	if cb != nil {
@@ -86,8 +85,6 @@ func testAgentWithConfigReload(t *testing.T, cb func(c *agent.Config), reloadCh 
 		t.Fatalf(fmt.Sprintf("err: %v", err))
 	}
 
-	rpc := agent.NewAgentRPC(a, l, mult, lw)
-
 	conf.Addresses.HTTP = "127.0.0.1"
 	httpAddr := fmt.Sprintf("127.0.0.1:%d", conf.Ports.HTTP)
 	http, err := agent.NewHTTPServers(a, conf, os.Stderr)
@@ -105,7 +102,6 @@ func testAgentWithConfigReload(t *testing.T, cb func(c *agent.Config), reloadCh 
 		dir:      dir,
 		config:   conf,
 		agent:    a,
-		rpc:      rpc,
 		http:     http[0],
 		addr:     l.Addr().String(),
 		httpAddr: httpAddr,
@@ -122,9 +118,10 @@ func nextConfig() *agent.Config {
 	conf.BindAddr = "127.0.0.1"
 	conf.Server = true
 
+	conf.Version = version.Version
+
 	conf.Ports.HTTP = 10000 + 10*idx
 	conf.Ports.HTTPS = 10401 + 10*idx
-	conf.Ports.RPC = 10100 + 10*idx
 	conf.Ports.SerfLan = 10201 + 10*idx
 	conf.Ports.SerfWan = 10202 + 10*idx
 	conf.Ports.Server = 10300 + 10*idx

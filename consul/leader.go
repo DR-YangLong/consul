@@ -152,6 +152,15 @@ func (s *Server) establishLeadership() error {
 			err)
 		return err
 	}
+
+	// Setup autopilot config if we are the leader and need to
+	if err := s.initializeAutopilot(); err != nil {
+		s.logger.Printf("[ERR] consul: Autopilot initialization failed: %v", err)
+		return err
+	}
+
+	s.startAutopilot()
+
 	return nil
 }
 
@@ -167,6 +176,9 @@ func (s *Server) revokeLeadership() error {
 		s.logger.Printf("[ERR] consul: Clearing session timers failed: %v", err)
 		return err
 	}
+
+	s.stopAutopilot()
+
 	return nil
 }
 
@@ -234,6 +246,29 @@ func (s *Server) initializeACL() error {
 		}
 
 	}
+	return nil
+}
+
+// initializeAutopilot is used to setup the autopilot config if we are
+// the leader and need to do this
+func (s *Server) initializeAutopilot() error {
+	// Bail if the config has already been initialized
+	state := s.fsm.State()
+	_, config, err := state.AutopilotConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get autopilot config: %v", err)
+	}
+	if config != nil {
+		return nil
+	}
+
+	req := structs.AutopilotSetConfigRequest{
+		Config: *s.config.AutopilotConfig,
+	}
+	if _, err = s.raftApply(structs.AutopilotRequestType, req); err != nil {
+		return fmt.Errorf("failed to initialize autopilot config")
+	}
+
 	return nil
 }
 
@@ -518,8 +553,9 @@ func (s *Server) handleDeregisterMember(reason string, member serf.Member) error
 	// Deregister the node
 	s.logger.Printf("[INFO] consul: member '%s' %s, deregistering", member.Name, reason)
 	req := structs.DeregisterRequest{
-		Datacenter: s.config.Datacenter,
-		Node:       member.Name,
+		Datacenter:   s.config.Datacenter,
+		Node:         member.Name,
+		WriteRequest: structs.WriteRequest{Token: s.config.GetTokenForAgent()},
 	}
 	var out struct{}
 	return s.endpoints.Catalog.Deregister(&req, &out)
@@ -544,35 +580,83 @@ func (s *Server) joinConsulServer(m serf.Member, parts *agent.Server) error {
 		}
 	}
 
-	// TODO (slackpad) - This will need to be changed once we support node IDs.
 	addr := (&net.TCPAddr{IP: m.Addr, Port: parts.Port}).String()
+
+	minRaftProtocol, err := ServerMinRaftProtocol(s.serfLAN.Members())
+	if err != nil {
+		return err
+	}
 
 	// See if it's already in the configuration. It's harmless to re-add it
 	// but we want to avoid doing that if possible to prevent useless Raft
-	// log entries.
+	// log entries. If the address is the same but the ID changed, remove the
+	// old server before adding the new one.
 	configFuture := s.raft.GetConfiguration()
 	if err := configFuture.Error(); err != nil {
 		s.logger.Printf("[ERR] consul: failed to get raft configuration: %v", err)
 		return err
 	}
 	for _, server := range configFuture.Configuration().Servers {
-		if server.Address == raft.ServerAddress(addr) {
+		// No-op if the raft version is too low
+		if server.Address == raft.ServerAddress(addr) && (minRaftProtocol < 2 || parts.RaftVersion < 3) {
 			return nil
+		}
+
+		// If the address or ID matches an existing server, see if we need to remove the old one first
+		if server.Address == raft.ServerAddress(addr) || server.ID == raft.ServerID(parts.ID) {
+			// Exit with no-op if this is being called on an existing server
+			if server.Address == raft.ServerAddress(addr) && server.ID == raft.ServerID(parts.ID) {
+				return nil
+			} else {
+				future := s.raft.RemoveServer(server.ID, 0, 0)
+				if server.Address == raft.ServerAddress(addr) {
+					if err := future.Error(); err != nil {
+						return fmt.Errorf("error removing server with duplicate address %q: %s", server.Address, err)
+					}
+					s.logger.Printf("[INFO] consul: removed server with duplicate address: %s", server.Address)
+				} else {
+					if err := future.Error(); err != nil {
+						return fmt.Errorf("error removing server with duplicate ID %q: %s", server.ID, err)
+					}
+					s.logger.Printf("[INFO] consul: removed server with duplicate ID: %s", server.ID)
+				}
+			}
 		}
 	}
 
 	// Attempt to add as a peer
-	addFuture := s.raft.AddPeer(raft.ServerAddress(addr))
-	if err := addFuture.Error(); err != nil {
-		s.logger.Printf("[ERR] consul: failed to add raft peer: %v", err)
-		return err
+	switch {
+	case minRaftProtocol >= 3:
+		addFuture := s.raft.AddNonvoter(raft.ServerID(parts.ID), raft.ServerAddress(addr), 0, 0)
+		if err := addFuture.Error(); err != nil {
+			s.logger.Printf("[ERR] consul: failed to add raft peer: %v", err)
+			return err
+		}
+	case minRaftProtocol == 2 && parts.RaftVersion >= 3:
+		addFuture := s.raft.AddVoter(raft.ServerID(parts.ID), raft.ServerAddress(addr), 0, 0)
+		if err := addFuture.Error(); err != nil {
+			s.logger.Printf("[ERR] consul: failed to add raft peer: %v", err)
+			return err
+		}
+	default:
+		addFuture := s.raft.AddPeer(raft.ServerAddress(addr))
+		if err := addFuture.Error(); err != nil {
+			s.logger.Printf("[ERR] consul: failed to add raft peer: %v", err)
+			return err
+		}
 	}
+
+	// Trigger a check to remove dead servers
+	select {
+	case s.autopilotRemoveDeadCh <- struct{}{}:
+	default:
+	}
+
 	return nil
 }
 
 // removeConsulServer is used to try to remove a consul server that has left
 func (s *Server) removeConsulServer(m serf.Member, port int) error {
-	// TODO (slackpad) - This will need to be changed once we support node IDs.
 	addr := (&net.TCPAddr{IP: m.Addr, Port: port}).String()
 
 	// See if it's already in the configuration. It's harmless to re-remove it
@@ -583,21 +667,39 @@ func (s *Server) removeConsulServer(m serf.Member, port int) error {
 		s.logger.Printf("[ERR] consul: failed to get raft configuration: %v", err)
 		return err
 	}
-	for _, server := range configFuture.Configuration().Servers {
-		if server.Address == raft.ServerAddress(addr) {
-			goto REMOVE
-		}
-	}
-	return nil
 
-REMOVE:
-	// Attempt to remove as a peer.
-	future := s.raft.RemovePeer(raft.ServerAddress(addr))
-	if err := future.Error(); err != nil {
-		s.logger.Printf("[ERR] consul: failed to remove raft peer '%v': %v",
-			addr, err)
+	minRaftProtocol, err := ServerMinRaftProtocol(s.serfLAN.Members())
+	if err != nil {
 		return err
 	}
+
+	_, parts := agent.IsConsulServer(m)
+
+	// Pick which remove API to use based on how the server was added.
+	for _, server := range configFuture.Configuration().Servers {
+		// If we understand the new add/remove APIs and the server was added by ID, use the new remove API
+		if minRaftProtocol >= 2 && server.ID == raft.ServerID(parts.ID) {
+			s.logger.Printf("[INFO] consul: removing server by ID: %q", server.ID)
+			future := s.raft.RemoveServer(raft.ServerID(parts.ID), 0, 0)
+			if err := future.Error(); err != nil {
+				s.logger.Printf("[ERR] consul: failed to remove raft peer '%v': %v",
+					server.ID, err)
+				return err
+			}
+			break
+		} else if server.Address == raft.ServerAddress(addr) {
+			// If not, use the old remove API
+			s.logger.Printf("[INFO] consul: removing server by address: %q", server.Address)
+			future := s.raft.RemovePeer(raft.ServerAddress(addr))
+			if err := future.Error(); err != nil {
+				s.logger.Printf("[ERR] consul: failed to remove raft peer '%v': %v",
+					addr, err)
+				return err
+			}
+			break
+		}
+	}
+
 	return nil
 }
 

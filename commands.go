@@ -21,11 +21,14 @@ func init() {
 	Commands = map[string]cli.CommandFactory{
 		"agent": func() (cli.Command, error) {
 			return &agent.Command{
+				Command: base.Command{
+					Flags: base.FlagSetNone,
+					Ui:    ui,
+				},
 				Revision:          version.GitCommit,
 				Version:           version.Version,
 				VersionPrerelease: version.VersionPrerelease,
 				HumanVersion:      version.GetHumanVersion(),
-				Ui:                ui,
 				ShutdownCh:        make(chan struct{}),
 			}, nil
 		},
@@ -208,6 +211,33 @@ func init() {
 			return &command.OperatorCommand{
 				Command: base.Command{
 					Flags: base.FlagSetNone,
+					Ui:    ui,
+				},
+			}, nil
+		},
+
+		"operator autopilot": func() (cli.Command, error) {
+			return &command.OperatorAutopilotCommand{
+				Command: base.Command{
+					Flags: base.FlagSetNone,
+					Ui:    ui,
+				},
+			}, nil
+		},
+
+		"operator autopilot get-config": func() (cli.Command, error) {
+			return &command.OperatorAutopilotGetCommand{
+				Command: base.Command{
+					Flags: base.FlagSetHTTP,
+					Ui:    ui,
+				},
+			}, nil
+		},
+
+		"operator autopilot set-config": func() (cli.Command, error) {
+			return &command.OperatorAutopilotSetCommand{
+				Command: base.Command{
+					Flags: base.FlagSetHTTP,
 					Ui:    ui,
 				},
 			}, nil
